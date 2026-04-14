@@ -11,6 +11,7 @@ This repository currently contains the Android client project used in Android St
 - ONNX Runtime inference on Android
 - Optional NCNN inference path through native library loading
 - Android 8.1+ NNAPI acceleration path with automatic CPU fallback
+- ONNX NNAPI toggle in the monitor UI with recent runtime logs and Logcat output
 - Overlay preview with bounding boxes, labels, confidence display, and aim-range visualization
 - Lightweight multi-target tracking pipeline
 - USB host / serial communication flow for external device control
@@ -92,6 +93,8 @@ The app supports importing model files through the UI into its private app stora
 
 - ONNX models are loaded directly with ONNX Runtime.
 - On Android 8.1 and above, the ONNX path now attempts to register the NNAPI execution provider first. On Android 10 and above, it first tries an accelerator-preferred NNAPI mode before falling back to regular NNAPI, and finally to CPU if the device or model cannot use NNAPI.
+- The monitor page exposes an `NNAPI` acceleration toggle. Turning it off forces CPU execution for ONNX models; changing it reloads the selected ONNX model with the new backend preference.
+- Recent ONNX initialization / inference messages are shown in the monitor UI and are also emitted to Logcat with the tag `HXHostOnnx`.
 - Actual NPU offload still depends on the target device's NNAPI drivers and whether the model operators are supported by that driver. Some models may run partly on accelerator hardware and partly on CPU.
 - NCNN models require paired `.param` and `.bin` files.
 - The NCNN path also expects the native library `hxhost_core` to be available at runtime.

@@ -22,6 +22,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.OpenableColumns
+import android.util.Log
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.widget.Toast
@@ -71,6 +72,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
@@ -167,6 +169,9 @@ private val MAKCU_BAUD_CANDIDATES_CH343 = intArrayOf(
 )
 private const val AUTO_CONFIG_PREFS = "hx_host_prefs"
 private const val AUTO_CONFIG_KEY = "app_auto_config_json"
+private const val ONNX_LOG_TAG = "HXHostOnnx"
+private const val ONNX_RUNTIME_LOG_LIMIT = 48
+private const val ONNX_INFERENCE_LOG_INTERVAL_MS = 3000L
 
 enum class ModelKind { NCNN, ONNX, FILE }
 
@@ -337,9 +342,11 @@ object OnnxEngine {
     )
 
     private val lock = Any()
+    private val _runtimeLogs = MutableStateFlow<List<String>>(emptyList())
     private var env: OrtEnvironment? = null
     private var session: OrtSession? = null
     private var sessionOptions: OrtSession.SessionOptions? = null
+    private var lastInferenceLogAtMs: Long = 0L
     private var inputName: String = "images"
     private var outputName: String = ""
     private var outputType: ai.onnxruntime.OnnxJavaType = ai.onnxruntime.OnnxJavaType.FLOAT
@@ -355,22 +362,48 @@ object OnnxEngine {
     @Volatile
     var lastStatus: String = "ONNX 未初始化"
         private set
+    @Volatile
+    var nnapiEnabled: Boolean = true
+        private set
+    @Volatile
+    var activeExecutionProvider: String = "未加载"
+        private set
 
-    fun init(modelPath: String, threads: Int): Boolean {
+    val runtimeLogs: StateFlow<List<String>> = _runtimeLogs.asStateFlow()
+
+    fun setNnapiEnabled(enabled: Boolean) {
+        if (nnapiEnabled == enabled) return
+        nnapiEnabled = enabled
+        appendRuntimeLog("I", "NNAPI 加速已${if (enabled) "开启" else "关闭"}")
+    }
+
+    fun clearRuntimeLogs() {
+        _runtimeLogs.value = emptyList()
+        appendRuntimeLog("I", "运行日志已清空")
+    }
+
+    fun init(modelPath: String, threads: Int, enableNnapi: Boolean = nnapiEnabled): Boolean {
         return synchronized(lock) {
+            nnapiEnabled = enableNnapi
             runCatching { session?.close() }
             runCatching { sessionOptions?.close() }
             runCatching { env?.close() }
             session = null
             sessionOptions = null
             env = null
+            activeExecutionProvider = "未加载"
             isInitialized = false
             outputName = ""
             lastStatus = "正在加载 ONNX..."
+            lastInferenceLogAtMs = 0L
+            appendRuntimeLog(
+                "I",
+                "初始化模型 ${File(modelPath).name} threads=${threads.coerceIn(1, 8)} nnapi=${if (enableNnapi) "on" else "off"}"
+            )
 
             val initResult = runCatching {
                 val e = OrtEnvironment.getEnvironment()
-                val init = createSessionWithFallback(e, modelPath, threads)
+                val init = createSessionWithFallback(e, modelPath, threads, enableNnapi)
                 val s = init.session
                 val firstInput = s.inputInfo.entries.firstOrNull()
                 if (firstInput != null) {
@@ -417,6 +450,7 @@ object OnnxEngine {
                 env = e
                 session = s
                 sessionOptions = init.options
+                activeExecutionProvider = init.providerLabel
                 isInitialized = true
                 val outputShape = runCatching {
                     val info = s.outputInfo[outputName]?.info as? ai.onnxruntime.TensorInfo
@@ -434,10 +468,12 @@ object OnnxEngine {
                 } else {
                     "ONNX 已加载: $providerSuffix in=${inputW}x$inputH c=$inputChannels ${if (inputNchw) "NCHW" else "NHWC"} ${inputType.name.lowercase(Locale.ROOT)} out=$outputName:${outputType.name.lowercase(Locale.ROOT)}($outputShape)"
                 }
+                appendRuntimeLog("I", lastStatus)
             }
             if (initResult.isFailure) {
                 val detail = initResult.exceptionOrNull()?.message?.take(120)?.ifBlank { null } ?: "未知错误"
                 lastStatus = "ONNX 初始化失败: $detail"
+                appendRuntimeLog("E", lastStatus)
             }
             initResult.isSuccess
         }
@@ -446,14 +482,25 @@ object OnnxEngine {
     private fun createSessionWithFallback(
         environment: OrtEnvironment,
         modelPath: String,
-        threads: Int
+        threads: Int,
+        enableNnapi: Boolean
     ): SessionInitResult {
+        if (!enableNnapi) {
+            appendRuntimeLog("I", "NNAPI 开关关闭，使用 CPU 会话")
+            return createCpuSession(environment, modelPath, threads, "manual cpu-only")
+        }
+
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O_MR1) {
+            appendRuntimeLog(
+                "W",
+                "设备 Android ${Build.VERSION.RELEASE} / API ${Build.VERSION.SDK_INT} 不支持 NNAPI，回退 CPU"
+            )
             return createCpuSession(environment, modelPath, threads, "Android 8.1 以下不支持 NNAPI")
         }
 
         var acceleratorOnlyError: Throwable? = null
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            appendRuntimeLog("I", "尝试 NNAPI accelerator-only 会话")
             val acceleratorOnly = runCatching {
                 createSession(environment, modelPath, threads) { options ->
                     options.addNnapi(EnumSet.of(NNAPIFlags.CPU_DISABLED))
@@ -466,8 +513,13 @@ object OnnxEngine {
                 )
             }
             acceleratorOnlyError = acceleratorOnly.exceptionOrNull()
+            appendRuntimeLog(
+                "W",
+                "NNAPI accelerator-only 初始化失败: ${formatProviderError(acceleratorOnlyError)}"
+            )
         }
 
+        appendRuntimeLog("I", "尝试标准 NNAPI 会话")
         val nnapiAuto = runCatching {
             createSession(environment, modelPath, threads) { options ->
                 options.addNnapi()
@@ -485,6 +537,10 @@ object OnnxEngine {
             )
         }
 
+        appendRuntimeLog(
+            "W",
+            "标准 NNAPI 初始化失败，回退 CPU: ${formatProviderError(nnapiAuto.exceptionOrNull())}"
+        )
         val detail = buildString {
             val acceleratorError = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 "accelerator-only=${formatProviderError(acceleratorOnlyError)}"
@@ -582,6 +638,11 @@ object OnnxEngine {
                     bitmapH = bitmap.height
                 )
                 lastStatus = "ONNX 推理完成: raw=${scaledBoxes.size} filtered=${filtered.size} out=${suppressed.size}"
+                val now = System.currentTimeMillis()
+                if (now - lastInferenceLogAtMs >= ONNX_INFERENCE_LOG_INTERVAL_MS) {
+                    lastInferenceLogAtMs = now
+                    appendRuntimeLog("D", "${lastStatus} ep=$activeExecutionProvider")
+                }
                 suppressed
             } finally {
                 runCatching { result?.close() }
@@ -590,12 +651,28 @@ object OnnxEngine {
         } catch (t: Throwable) {
             val detail = t.message?.take(120)?.ifBlank { null } ?: t.javaClass.simpleName
             lastStatus = "ONNX 推理失败: $detail"
+            appendRuntimeLog("E", lastStatus)
             emptyList()
         } finally {
             if (scaled !== bitmap) {
                 runCatching { scaled.recycle() }
             }
         }
+    }
+
+    private fun appendRuntimeLog(level: String, message: String) {
+        val line = "${runtimeTimestamp()} [$level] $message"
+        _runtimeLogs.value = (_runtimeLogs.value + line).takeLast(ONNX_RUNTIME_LOG_LIMIT)
+        when (level) {
+            "E" -> Log.e(ONNX_LOG_TAG, message)
+            "W" -> Log.w(ONNX_LOG_TAG, message)
+            "D" -> Log.d(ONNX_LOG_TAG, message)
+            else -> Log.i(ONNX_LOG_TAG, message)
+        }
+    }
+
+    private fun runtimeTimestamp(): String {
+        return String.format(Locale.ROOT, "%1\$tT.%1\$tL", System.currentTimeMillis())
     }
 
     private fun Long.toIntOrNullPositive(): Int? {
@@ -3123,6 +3200,7 @@ fun MainApp() {
     val context = LocalContext.current
     val prefs = remember(context) { context.getSharedPreferences(AUTO_CONFIG_PREFS, Context.MODE_PRIVATE) }
     var autoConfigLoaded by remember { mutableStateOf(false) }
+    var onnxReloadWatcherArmed by remember { mutableStateOf(false) }
 
     var currentTab by rememberSaveable { mutableStateOf(AppTab.Monitor) }
     var running by rememberSaveable { mutableStateOf(false) }
@@ -3132,6 +3210,7 @@ fun MainApp() {
     var confidence by rememberSaveable { mutableStateOf(0.25f) }
     var nms by rememberSaveable { mutableStateOf(0.45f) }
     var selectedModel by rememberSaveable { mutableStateOf("未选择模型") }
+    var onnxNnapiEnabled by rememberSaveable { mutableStateOf(true) }
     var inferenceThreads by rememberSaveable { mutableStateOf(4) }
     var receiveFps by rememberSaveable { mutableStateOf(240) }
     var dynamicColor by rememberSaveable { mutableStateOf(false) }
@@ -3161,6 +3240,7 @@ fun MainApp() {
     var enableStuckHoldRecovery by rememberSaveable { mutableStateOf(false) }
 
     val modelOptions = remember { mutableStateListOf<ModelEntry>() }
+    val onnxRuntimeLogs by OnnxEngine.runtimeLogs.collectAsState()
     val hotkeys = remember {
         mutableStateListOf(
             HotkeyConfig("热键1"),
@@ -3195,7 +3275,7 @@ fun MainApp() {
                 }
             }
             entry.kind == ModelKind.ONNX && !entry.filePath.isNullOrBlank() -> {
-                val ok = OnnxEngine.init(entry.filePath!!, inferenceThreads)
+                val ok = OnnxEngine.init(entry.filePath!!, inferenceThreads, onnxNnapiEnabled)
                 RuntimeBridge.selectedModelKind = if (ok) ModelKind.ONNX else ModelKind.FILE
                 if (!silent) {
                     val msg = if (ok) {
@@ -3221,6 +3301,7 @@ fun MainApp() {
         put("confidence", confidence.toDouble())
         put("nms", nms.toDouble())
         put("selectedModel", selectedModel)
+        put("onnxNnapiEnabled", onnxNnapiEnabled)
         put("inferenceThreads", inferenceThreads)
         put("receiveFps", receiveFps)
         put("dynamicColor", dynamicColor)
@@ -3258,6 +3339,7 @@ fun MainApp() {
         confidence = root.optDouble("confidence", 0.25).toFloat().coerceIn(0f, 1f)
         nms = root.optDouble("nms", 0.45).toFloat().coerceIn(0f, 1f)
         selectedModel = root.optString("selectedModel", selectedModel)
+        onnxNnapiEnabled = root.optBoolean("onnxNnapiEnabled", true)
         val cores = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
         inferenceThreads = root.optInt("inferenceThreads", 4).coerceIn(1, cores)
         receiveFps = root.optInt("receiveFps", 240).coerceIn(30, 240)
@@ -3371,6 +3453,9 @@ fun MainApp() {
         RuntimeBridge.confidence = confidence.coerceIn(0f, 1f)
         RuntimeBridge.nms = nms.coerceIn(0f, 1f)
     }
+    LaunchedEffect(onnxNnapiEnabled) {
+        OnnxEngine.setNnapiEnabled(onnxNnapiEnabled)
+    }
     LaunchedEffect(hotkeys.toList()) {
         RuntimeBridge.hotkeys = hotkeys.toList()
     }
@@ -3445,6 +3530,16 @@ fun MainApp() {
         if (selectedModel.isBlank() || selectedModel == "未选择模型") return@LaunchedEffect
         initModelIfNeeded(selectedModel, silent = true)
     }
+    LaunchedEffect(autoConfigLoaded, inferenceThreads, onnxNnapiEnabled) {
+        if (!autoConfigLoaded) return@LaunchedEffect
+        if (!onnxReloadWatcherArmed) {
+            onnxReloadWatcherArmed = true
+            return@LaunchedEffect
+        }
+        val entry = modelOptions.firstOrNull { it.name == selectedModel } ?: return@LaunchedEffect
+        if (entry.kind != ModelKind.ONNX || entry.filePath.isNullOrBlank()) return@LaunchedEffect
+        initModelIfNeeded(selectedModel, silent = true)
+    }
     DisposableEffect(Unit) { onDispose { ReceiverEngine.stop() } }
 
     HXHostTheme(dynamicColor = dynamicColor) {
@@ -3477,6 +3572,8 @@ fun MainApp() {
                         showLabelTag = showLabelTag,
                         showConfidencePercent = showConfidencePercent,
                         selectedModel = selectedModel,
+                        onnxNnapiEnabled = onnxNnapiEnabled,
+                        onnxRuntimeLogs = onnxRuntimeLogs,
                         modelNames = modelOptions.map { it.name },
                         onToggleRun = { running = it },
                         onProtocolChange = { isUdp = it },
@@ -3485,6 +3582,8 @@ fun MainApp() {
                         onShowLabelTagChange = { showLabelTag = it },
                         onShowConfidencePercentChange = { showConfidencePercent = it },
                         onSelectModel = { selectedModel = it; initModelIfNeeded(it) },
+                        onOnnxNnapiEnabledChange = { onnxNnapiEnabled = it },
+                        onClearOnnxLogs = { OnnxEngine.clearRuntimeLogs() },
                         onImportModel = { importModelLauncher.launch(arrayOf("*/*")) },
                         onExportConfig = { exportConfigLauncher.launch("hx_host_config.json") },
                         onImportConfig = { importConfigLauncher.launch(arrayOf("application/json", "text/plain")) }
@@ -3571,6 +3670,8 @@ fun MonitorScreen(
     showLabelTag: Boolean,
     showConfidencePercent: Boolean,
     selectedModel: String,
+    onnxNnapiEnabled: Boolean,
+    onnxRuntimeLogs: List<String>,
     modelNames: List<String>,
     onToggleRun: (Boolean) -> Unit,
     onProtocolChange: (Boolean) -> Unit,
@@ -3579,6 +3680,8 @@ fun MonitorScreen(
     onShowLabelTagChange: (Boolean) -> Unit,
     onShowConfidencePercentChange: (Boolean) -> Unit,
     onSelectModel: (String) -> Unit,
+    onOnnxNnapiEnabledChange: (Boolean) -> Unit,
+    onClearOnnxLogs: () -> Unit,
     onImportModel: () -> Unit,
     onExportConfig: () -> Unit,
     onImportConfig: () -> Unit
@@ -3586,6 +3689,7 @@ fun MonitorScreen(
     var menuExpanded by remember { mutableStateOf(false) }
     var detectExpanded by rememberSaveable { mutableStateOf(false) }
     var modelExpanded by remember { mutableStateOf(false) }
+    var runtimeLogExpanded by rememberSaveable { mutableStateOf(false) }
     val cardColor = Color(0xFFEFEFEF)
     val sliderColors = SliderDefaults.colors(
         thumbColor = Color(0xFF6F6F6F),
@@ -3731,7 +3835,78 @@ fun MonitorScreen(
                     }
                 }
                 Text("支持: .param/.bin (NCNN), .onnx (YOLOv8/v11/INT8)", fontSize = 12.sp, color = Color.Gray)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text("NNAPI 加速", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF4C4C4C))
+                        Text(
+                            if (onnxNnapiEnabled) "开启后优先尝试 NNAPI/NPU，不支持时自动回退 CPU" else "已固定使用 CPU 推理",
+                            fontSize = 11.sp,
+                            color = Color(0xFF7A7A7A)
+                        )
+                    }
+                    Switch(
+                        checked = onnxNnapiEnabled,
+                        onCheckedChange = onOnnxNnapiEnabledChange,
+                        enabled = !running
+                    )
+                }
+                Text("当前后端: ${OnnxEngine.activeExecutionProvider}", fontSize = 11.sp, color = Color(0xFF6A6A6A))
                 Text("ONNX 状态: ${OnnxEngine.lastStatus}", fontSize = 11.sp, color = Color(0xFF6A6A6A))
+            }
+        }
+
+        Card(
+            colors = CardDefaults.cardColors(containerColor = cardColor),
+            shape = RoundedCornerShape(16.dp)
+        ) {
+            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column {
+                        Text("ONNX 运行日志", fontWeight = FontWeight.Bold, fontSize = 14.sp, color = Color(0xFF555555))
+                        Text("最近 ${onnxRuntimeLogs.size} 条，会同步写入 Logcat/$ONNX_LOG_TAG", fontSize = 11.sp, color = Color(0xFF7A7A7A))
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        TextButton(onClick = onClearOnnxLogs, contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp)) {
+                            Text("清空", fontSize = 12.sp)
+                        }
+                        IconButton(onClick = { runtimeLogExpanded = !runtimeLogExpanded }, modifier = Modifier.size(28.dp)) {
+                            Icon(
+                                if (runtimeLogExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                                null,
+                                tint = Color(0xFF666666)
+                            )
+                        }
+                    }
+                }
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                    color = Color(0xFF202226)
+                ) {
+                    Column(Modifier.padding(horizontal = 10.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        val visibleLogs = onnxRuntimeLogs.asReversed().take(if (runtimeLogExpanded) 12 else 5)
+                        if (visibleLogs.isEmpty()) {
+                            Text("暂无运行日志", color = Color(0xFFBFC6CF), fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+                        } else {
+                            visibleLogs.forEach { line ->
+                                Text(
+                                    line,
+                                    color = Color(0xFFE4E8ED),
+                                    fontSize = 11.sp,
+                                    fontFamily = FontFamily.Monospace
+                                )
+                            }
+                        }
+                    }
+                }
             }
         }
 
